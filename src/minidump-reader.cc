@@ -1,5 +1,6 @@
 #include "src/minidump-reader.h"
 
+#include <cstdio>
 #include <cstring>
 #include <sstream>
 
