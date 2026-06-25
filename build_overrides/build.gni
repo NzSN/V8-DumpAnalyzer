@@ -1,0 +1,5 @@
+# Required by GN build configs that reference these.
+declare_args() {
+  build_with_chromium = false
+  build_with_v8 = false
+}
