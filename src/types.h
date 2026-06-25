@@ -23,9 +23,7 @@ struct MINIDUMP_HEADER {
 
 struct MINIDUMP_DIRECTORY {
   uint32_t stream_type;
-  uint32_t data_size;
-  uint32_t rva;
-  uint32_t reserved;
+  MINIDUMP_LOCATION_DESCRIPTOR location;
 };
 
 struct MINIDUMP_LOCATION_DESCRIPTOR {
