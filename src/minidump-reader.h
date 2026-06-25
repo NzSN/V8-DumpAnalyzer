@@ -1,6 +1,7 @@
 #ifndef SRC_MINIDUMP_READER_H_
 #define SRC_MINIDUMP_READER_H_
 
+#include <cstddef>
 #include <string>
 #include <vector>
 

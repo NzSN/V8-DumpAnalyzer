@@ -18,11 +18,20 @@ bool MinidumpReader::Open(const std::string& path, std::string* error_out) {
     return false;
   }
 
-  fseek(fp, 0, SEEK_END);
-  size_t size = ftell(fp);
-  fseek(fp, 0, SEEK_SET);
+  if (fseek(fp, 0, SEEK_END) != 0) {
+    fclose(fp);
+    *error_out = "Cannot seek in file";
+    return false;
+  }
+  long size = ftell(fp);
+  if (size < 0) {
+    fclose(fp);
+    *error_out = "Cannot get file size";
+    return false;
+  }
+  rewind(fp);
 
-  file_data_.resize(size);
+  file_data_.resize(static_cast<size_t>(size));
   if (fread(file_data_.data(), 1, size, fp) != size) {
     fclose(fp);
     *error_out = "Failed to read file";
@@ -68,7 +77,10 @@ bool MinidumpReader::ParseStreams(const std::vector<uint8_t>& data) {
   uint32_t dir_offset = header.stream_directory_rva;
   for (uint32_t i = 0; i < header.number_of_streams; i++) {
     uint32_t off = dir_offset + i * sizeof(MINIDUMP_DIRECTORY);
-    if (off + sizeof(MINIDUMP_DIRECTORY) > data.size()) break;
+    if (off + sizeof(MINIDUMP_DIRECTORY) > data.size()) {
+      error_ = "Stream directory entry out of bounds";
+      return false;
+    }
 
     MINIDUMP_DIRECTORY dir;
     std::memcpy(&dir, data.data() + off, sizeof(dir));
@@ -113,8 +125,9 @@ bool MinidumpReader::ParseMemoryList(const std::vector<uint8_t>& data,
     if (data_off + data_size <= data.size()) {
       region.data.assign(data.data() + data_off,
                          data.data() + data_off + data_size);
-    } else if (data_off < data.size()) {
-      region.data.assign(data.data() + data_off, data.end());
+    } else {
+      error_ = "Memory region data out of bounds";
+      return false;
     }
     memory_regions_.push_back(std::move(region));
   }
@@ -165,9 +178,10 @@ bool MinidumpReader::ReadMemory(uint64_t address, size_t size,
                                 std::vector<uint8_t>* out) const {
   for (const auto& region : memory_regions_) {
     uint64_t start = region.start_address;
-    uint64_t end = start + region.data.size();
-    if (address >= start && address + size <= end) {
-      size_t offset = address - start;
+    if (address >= start) {
+      uint64_t offset = address - start;
+      if (offset > region.data.size()) continue;
+      if (size > region.data.size() - static_cast<size_t>(offset)) continue;
       out->assign(region.data.begin() + offset,
                   region.data.begin() + offset + size);
       return true;
