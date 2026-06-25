@@ -7,6 +7,25 @@
 
 namespace dump_analyzer {
 
+namespace detail {
+inline std::string JSONEscape(const std::string& s) {
+  std::string out;
+  out.push_back('"');
+  for (char c : s) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default: out.push_back(c);
+    }
+  }
+  out.push_back('"');
+  return out;
+}
+}  // namespace detail
+
 class OutputFormatter {
  public:
   explicit OutputFormatter(bool json_output);
