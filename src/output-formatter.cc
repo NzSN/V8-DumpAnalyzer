@@ -56,7 +56,7 @@ std::string OutputFormatter::FormatText(const AnalysisResult& result) const {
 std::string OutputFormatter::FormatJson(const AnalysisResult& result) const {
   std::ostringstream oss;
   oss << "{\n";
-  oss << "  \"file\": " << JSONEscape(result.minidump_path) << ",\n";
+  oss << "  \"file\": " << detail::JSONEscape(result.minidump_path) << ",\n";
   oss << "  \"regions\": [\n";
   for (size_t i = 0; i < result.regions.size(); i++) {
     if (i > 0) oss << ",\n";
@@ -71,7 +71,7 @@ std::string OutputFormatter::FormatJson(const AnalysisResult& result) const {
   oss << "  \"warnings\": [\n";
   for (size_t i = 0; i < result.warnings.size(); i++) {
     if (i > 0) oss << ",\n";
-    oss << "    " << JSONEscape(result.warnings[i]);
+    oss << "    " << detail::JSONEscape(result.warnings[i]);
   }
   oss << "\n  ]\n";
   oss << "}\n";

@@ -2,4 +2,5 @@
 declare_args() {
   build_with_chromium = false
   build_with_v8 = false
+  build_with_v8_embedder = false
 }

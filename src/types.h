@@ -21,14 +21,14 @@ struct MINIDUMP_HEADER {
   uint64_t flags;
 };
 
-struct MINIDUMP_DIRECTORY {
-  uint32_t stream_type;
-  MINIDUMP_LOCATION_DESCRIPTOR location;
-};
-
 struct MINIDUMP_LOCATION_DESCRIPTOR {
   uint32_t data_size;
   uint32_t rva;
+};
+
+struct MINIDUMP_DIRECTORY {
+  uint32_t stream_type;
+  MINIDUMP_LOCATION_DESCRIPTOR location;
 };
 
 struct MINIDUMP_MEMORY_DESCRIPTOR {

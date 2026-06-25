@@ -1,1 +1,9 @@
 out/
+.gclient_entries
+.gclient_previous_sync_commits
+build/
+buildtools/
+testing/
+third_party/
+tools/
+v8/

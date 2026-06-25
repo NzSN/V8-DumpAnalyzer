@@ -4,9 +4,6 @@
 #include <map>
 #include <sstream>
 
-#include "src/objects/instance-type.h"
-#include "src/objects/tagged.h"
-
 namespace dump_analyzer {
 
 HeapScanner::HeapScanner() = default;

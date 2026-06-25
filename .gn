@@ -14,4 +14,5 @@ default_args = {
   v8_enable_javascript = false
   use_custom_libcxx = false
   treat_warnings_as_errors = false
+  enable_js_protobuf = false
 }

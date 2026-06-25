@@ -24,7 +24,7 @@ executable("dump_analyzer") {
     "src/types.h",
   ]
 
-  configs = [ ":internal_include_dirs" ]
+  configs += [ ":internal_include_dirs" ]
 
   deps = [
     "//v8:v8",
