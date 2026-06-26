@@ -228,56 +228,42 @@ void Sym::walk(const MD& m) {
       addr_str += tmp;
     }
     if (!addr_str.empty()) {
-      HANDLE hInR, hInW, hOutR, hOutW;
-      SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-      CreatePipe(&hInR, &hInW, &sa, 0);
-      CreatePipe(&hOutR, &hOutW, &sa, 0);
-      SetHandleInformation(hOutR, HANDLE_FLAG_INHERIT, 0);
-      STARTUPINFOA si = { sizeof(si) };
-      si.dwFlags = STARTF_USESTDHANDLES;
-      si.hStdInput  = hInR;
-      si.hStdOutput = hOutW;
-      si.hStdError  = hOutW;
-      PROCESS_INFORMATION pi = {};
-      char cmd[1024];
       const char* llvm_sym = "llvm-symbolizer";
-      // Prefer Electron's LLVM toolchain (same as build.bat uses for clang-cl)
       if (GetFileAttributesA("D:\\Codebase\\electron\\src\\third_party\\llvm-build\\Release+Asserts\\bin\\llvm-symbolizer.exe") != INVALID_FILE_ATTRIBUTES)
         llvm_sym = "\"D:\\Codebase\\electron\\src\\third_party\\llvm-build\\Release+Asserts\\bin\\llvm-symbolizer.exe\"";
-      snprintf(cmd, sizeof(cmd),
-        "%s --obj=\"%s\" --output-style=LLVM --functions=linkage",
-        llvm_sym, exe_path.c_str());
-      if (CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
-        CloseHandle(hOutW); CloseHandle(hInR);
-        DWORD wx; WriteFile(hInW, addr_str.c_str(), (DWORD)addr_str.size(), &wx, NULL);
-        CloseHandle(hInW);
-        WaitForSingleObject(pi.hProcess, 30000);
-        // Read output after process exits
-        char obuf[65536] = {}; DWORD orx = 0;
-        ReadFile(hOutR, obuf, sizeof(obuf) - 1, &orx, NULL);
-        CloseHandle(hOutR);
-        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-        printf("  [llvm] output (%u bytes): %.200s\n", orx, obuf);
-        // Parse: function\nsource\nblank...
-        std::string out(obuf, orx);
-        size_t pos = 0, ai = 0;
-        while (pos < out.size() && ai < dedup.size()) {
-          size_t nl1 = out.find('\n', pos);
-          size_t nl2 = nl1 != std::string::npos ? out.find('\n', nl1 + 1) : std::string::npos;
-          if (nl1 == std::string::npos) break;
-          std::string func = out.substr(pos, nl1 - pos);
-          std::string src;
-          if (nl2 != std::string::npos) src = out.substr(nl1 + 1, nl2 - nl1 - 1);
-          if (!func.empty() && func != "??") {
-            sym_map[dedup[ai]] = func;
-            if (!src.empty() && src != "??:0" && src != "??:0:0") src_map[dedup[ai]] = src;
-          }
-          pos = nl2 != std::string::npos ? nl2 + 1 : nl1 + 1;
-          ai++;
+      // Temp file approach (no pipe deadlock)
+      // Write addresses to temp file, run llvm-symbolizer, read output
+      char tmp_in[MAX_PATH] = {}, tmp_out[MAX_PATH] = {};
+      GetTempPathA(sizeof(tmp_in), tmp_in);
+      strcat(tmp_in, "dmpa_in.txt");
+      strcat(strcpy(tmp_out, tmp_in), "out.txt");
+      tmp_out[strlen(tmp_out)-7] = 0; strcat(tmp_out, "out.txt");
+      FILE* f = fopen(tmp_in, "w");
+      if (f) { fwrite(addr_str.c_str(), 1, addr_str.size(), f); fclose(f); }
+      char sys_cmd[2048];
+      snprintf(sys_cmd, sizeof(sys_cmd),
+        "cmd /c \"%s --obj=\"%s\" --output-style=LLVM --functions=linkage < \"%s\" > \"%s\" 2>nul\"",
+        llvm_sym, exe_path.c_str(), tmp_in, tmp_out);
+      system(sys_cmd);
+      // Parse output
+      char out[65536] = {}; f = fopen(tmp_out, "r");
+      if (f) { fread(out, 1, sizeof(out)-1, f); fclose(f); }
+      DeleteFileA(tmp_in); DeleteFileA(tmp_out);
+      std::string sout(out);
+      size_t pos = 0, ai = 0;
+      while (pos < sout.size() && ai < dedup.size()) {
+        size_t nl1 = sout.find('\n', pos);
+        size_t nl2 = nl1 != std::string::npos ? sout.find('\n', nl1 + 1) : std::string::npos;
+        if (nl1 == std::string::npos) break;
+        std::string func = sout.substr(pos, nl1 - pos);
+        std::string src;
+        if (nl2 != std::string::npos) src = sout.substr(nl1 + 1, nl2 - nl1 - 1);
+        if (!func.empty() && func != "??") {
+          sym_map[dedup[ai]] = func;
+          if (!src.empty() && src != "??:0" && src != "??:0:0") src_map[dedup[ai]] = src;
         }
-      } else {
-        printf("  [llvm] CreateProcess FAILED cmd=%s\n", cmd);
-        CloseHandle(hOutW); CloseHandle(hOutR); CloseHandle(hInW); CloseHandle(hInR);
+        pos = nl2 != std::string::npos ? nl2 + 1 : nl1 + 1;
+        ai++;
       }
     }
   }
