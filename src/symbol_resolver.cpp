@@ -45,15 +45,7 @@ bool Sym::init(const char* path, const MD& m) {
         start = end + 1;
       }
     }
-    if (mod.cv_sz > 0 && mod.cv_rva > 0 && GetFileAttributesA(found.c_str()) != INVALID_FILE_ATTRIBUTES) {
-      std::vector<char> cv(mod.cv_sz);
-      if (m.rd(mod.cv_rva, mod.cv_sz, cv.data())) {
-        MODLOAD_DATA mld = { sizeof(MODLOAD_DATA), 0xD2F4AC7A, cv.data(), mod.cv_sz, 0 };
-        SymLoadModuleEx(proc, NULL, found.c_str(), fname, mod.base, mod.sz, &mld, 0);
-      }
-    } else {
-      SymLoadModuleEx(proc, NULL, found.c_str(), NULL, mod.base, mod.sz, NULL, 0);
-    }
+    SymLoadModuleEx(proc, NULL, found.c_str(), NULL, mod.base, mod.sz, NULL, 0);
   }
 
   // Open DIA sessions via DllGetClassObject (msdia140.dll may not be COM-registered)
