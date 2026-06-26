@@ -1,0 +1,21 @@
+# V8-DumpAnalyzer
+# Standalone GN build target.
+# To build: gn gen out/Release && ninja -C out/Release dump_analyzer
+
+import("//v8/gni/v8.gni")
+
+executable("dump_analyzer") {
+  sources = [ "src/dump_analyzer.cc" ]
+  output_name = "dump_analyzer"
+
+  deps = [
+    "//v8:v8_headers",
+    "//v8:v8_libbase",
+  ]
+
+  configs += [ "//v8:internal_config_base" ]
+
+  if (is_win) {
+    libs = [ "dbghelp.lib" ]
+  }
+}

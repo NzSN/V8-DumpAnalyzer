@@ -1,34 +1,4 @@
-import("//build_overrides/build.gni")
-import("//build/config/v8_target_cpu.gni")
-
-config("internal_include_dirs") {
-  include_dirs = [
-    "//v8",
-    "//v8/include",
-    "$root_gen_dir/v8",
-    "$root_gen_dir/v8/include",
-  ]
-}
-
-executable("dump_analyzer") {
-  sources = [
-    "src/main.cc",
-    "src/analyzer.cc",
-    "src/analyzer.h",
-    "src/minidump-reader.cc",
-    "src/minidump-reader.h",
-    "src/heap-scanner.cc",
-    "src/heap-scanner.h",
-    "src/output-formatter.cc",
-    "src/output-formatter.h",
-    "src/types.h",
-  ]
-
-  configs += [ ":internal_include_dirs" ]
-
-  deps = [
-    "//v8:v8",
-    "//v8:v8_libbase",
-    "//v8:v8_libplatform",
-  ]
+# Root BUILD.gn for V8-DumpAnalyzer
+group("default") {
+  deps = [ "//src:dump_analyzer" ]
 }

@@ -1,18 +1,2 @@
-# Use Chromium's build config (pulled via DEPS or local checkout).
 buildconfig = "//build/config/BUILDCONFIG.gn"
-script_executable = "python3"
-
-default_args = {
-  # V8 standalone build settings matching the local checkout.
-  v8_monolithic = false
-  is_component_build = false
-  v8_use_external_startup_data = false
-  v8_enable_i18n_support = false
-  v8_enable_webassembly = false
-  v8_enable_maglev = false
-  v8_enable_turbofan = false
-  v8_enable_javascript = false
-  use_custom_libcxx = false
-  treat_warnings_as_errors = false
-  enable_js_protobuf = false
-}
+check_targets = []
