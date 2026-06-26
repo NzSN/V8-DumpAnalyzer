@@ -16,7 +16,7 @@ BOOL CALLBACK read_mem(HANDLE, DWORD64 addr, PVOID buf, DWORD sz, LPDWORD read) 
 bool Sym::init(const char* path, const MD& m) {
   proc = GetCurrentProcess();
   CoInitialize(NULL);
-  SymSetOptions(SYMOPT_UNDNAME | SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_ANYTHING);
+  SymSetOptions(SYMOPT_UNDNAME | SYMOPT_LOAD_LINES | SYMOPT_LOAD_ANYTHING);
   if (!SymInitialize(proc, NULL, FALSE)) return false;
   if (path) SymSetSearchPath(proc, path);
 
@@ -56,7 +56,7 @@ bool Sym::init(const char* path, const MD& m) {
     }
   }
 
-  // Open DIA sessions for PDBs (scope-level resolution)
+  // Open DIA sessions via DllGetClassObject (msdia140.dll may not be COM-registered)
   for (auto& mod : m.mods) {
     IMAGEHLP_MODULE64 mi = { sizeof(IMAGEHLP_MODULE64) };
     if (!SymGetModuleInfo64(proc, mod.base, &mi) || !mi.LoadedPdbName[0])
@@ -64,14 +64,28 @@ bool Sym::init(const char* path, const MD& m) {
     wchar_t wpdb[MAX_PATH] = {};
     mbstowcs(wpdb, mi.LoadedPdbName, MAX_PATH);
     IDiaDataSource* src = NULL;
-    if (FAILED(CoCreateInstance(CLSID_DiaSource, NULL, CLSCTX_INPROC_SERVER,
-                                 IID_IDiaDataSource, (void**)&src)))
-      continue;
-    if (FAILED(src->loadDataFromPdb(wpdb))) { src->Release(); continue; }
-    IDiaSession* sess = NULL;
-    if (FAILED(src->openSession(&sess))) { src->Release(); continue; }
-    dia_sessions[mod.base] = sess;
-    dia_sources[mod.base] = src;
+    HMODULE hDia = LoadLibraryW(L"msdia140.dll");
+    if (hDia) {
+      auto DllGC = (decltype(&DllGetClassObject))GetProcAddress(hDia, "DllGetClassObject");
+      if (DllGC) {
+        IClassFactory* cf = NULL;
+        if (SUCCEEDED(DllGC(CLSID_DiaSource, IID_IClassFactory, (void**)&cf))) {
+          if (SUCCEEDED(cf->CreateInstance(NULL, IID_IDiaDataSource, (void**)&src))) {
+            if (SUCCEEDED(src->loadDataFromPdb(wpdb))) {
+              IDiaSession* sess = NULL;
+              if (SUCCEEDED(src->openSession(&sess))) {
+                dia_sessions[mod.base] = sess;
+                dia_sources[mod.base] = src;
+                cf->Release();
+                continue;
+              }
+            }
+          }
+          cf->Release();
+        }
+      }
+    }
+    if (src) src->Release();
   }
 
   ok = true;
@@ -80,57 +94,51 @@ bool Sym::init(const char* path, const MD& m) {
 
 std::string Sym::resolve(uint64_t addr) {
   if (!ok) return {};
-
-  // DIA scope resolution
   uint64_t mod_base = SymGetModuleBase64(proc, addr);
   auto it = dia_sessions.find(mod_base);
+
+  // DIA scope-level resolution (finds public+private symbols like CDB)
   if (it != dia_sessions.end()) {
     IDiaSymbol* sym = NULL;
     LONG disp = 0;
     ULONGLONG rva = addr - mod_base;
     if (SUCCEEDED(it->second->findSymbolByRVAEx((DWORD)rva, SymTagNull, &sym, &disp)) && sym) {
-      IDiaEnumSymbols* inline_syms = NULL;
-      if (SUCCEEDED(sym->findInlineFramesByRVA((DWORD)rva, &inline_syms)) && inline_syms) {
-        IDiaSymbol* i_sym = NULL, *best = NULL;
-        ULONG fetched = 0;
-        while (SUCCEEDED(inline_syms->Next(1, &i_sym, &fetched)) && fetched) {
-          if (best) best->Release();
-          best = i_sym;
+      // Walk lexical parent chain if innermost symbol has no name
+      IDiaSymbol* named = sym; sym = NULL;
+      while (named) {
+        BSTR nm = NULL; named->get_name(&nm);
+        DWORD len = SysStringLen(nm); SysFreeString(nm);
+        if (len > 0) break; // found named symbol
+        IDiaSymbol* parent = NULL;
+        if (FAILED(named->get_lexicalParent(&parent)) || !parent) break;
+        DWORD prva = 0; parent->get_relativeVirtualAddress(&prva);
+        if (prva) disp = (LONG)(rva - prva);
+        named->Release(); named = parent;
+      }
+      // Also try findSymbolByRVAEx with SymTagFunction for function name
+      if (!named) {
+        IDiaSymbol* fnsym = NULL; LONG fnd = 0;
+        if (SUCCEEDED(it->second->findSymbolByRVAEx((DWORD)rva, SymTagFunction, &fnsym, &fnd)) && fnsym) {
+          named = fnsym;
+          disp = fnd;
         }
-        inline_syms->Release();
-        if (best) {
-          DWORD i_rva = 0; best->get_relativeVirtualAddress(&i_rva);
-          LONG i_disp = (DWORD)rva - i_rva;
-          BSTR wname;
-          if (SUCCEEDED(best->get_name(&wname))) {
-            char aname[1024]; wcstombs(aname, wname, sizeof(aname)); SysFreeString(wname);
-            best->Release(); sym->Release();
-            std::string r = aname;
-            if (i_disp > 0) { char tmp[64]; snprintf(tmp, sizeof(tmp), "+0x%lx", i_disp); r += tmp; }
-            DWORD ldisp; IMAGEHLP_LINE64 line; memset(&line, 0, sizeof(line)); line.SizeOfStruct = sizeof(line);
-            if (SymGetLineFromAddr64(proc, addr, &ldisp, &line)) {
-              const char* fn = strrchr(line.FileName, '\\'); fn = fn ? fn + 1 : line.FileName;
-              char tmp[256]; snprintf(tmp, sizeof(tmp), " [%s:%lu]", fn, line.LineNumber); r += tmp;
-            }
-            return " " + r;
+      }
+      if (named) {
+        BSTR wname;
+        if (SUCCEEDED(named->get_name(&wname))) {
+          char aname[1024]; wcstombs(aname, wname, sizeof(aname)); SysFreeString(wname);
+          named->Release();
+          std::string r = aname;
+          if (disp > 0) { char tmp[64]; snprintf(tmp, sizeof(tmp), "+0x%lx", disp); r += tmp; }
+          DWORD ldisp; IMAGEHLP_LINE64 line; memset(&line, 0, sizeof(line)); line.SizeOfStruct = sizeof(line);
+          if (SymGetLineFromAddr64(proc, addr, &ldisp, &line)) {
+            const char* fn = strrchr(line.FileName, '\\'); fn = fn ? fn + 1 : line.FileName;
+            char tmp[256]; snprintf(tmp, sizeof(tmp), " [%s:%lu]", fn, line.LineNumber); r += tmp;
           }
-          best->Release();
+          return " " + r;
         }
+        named->Release();
       }
-      BSTR wname;
-      if (SUCCEEDED(sym->get_name(&wname))) {
-        char aname[1024]; wcstombs(aname, wname, sizeof(aname)); SysFreeString(wname);
-        sym->Release();
-        std::string r = aname;
-        if (disp > 0) { char tmp[64]; snprintf(tmp, sizeof(tmp), "+0x%lx", disp); r += tmp; }
-        DWORD ldisp; IMAGEHLP_LINE64 line; memset(&line, 0, sizeof(line)); line.SizeOfStruct = sizeof(line);
-        if (SymGetLineFromAddr64(proc, addr, &ldisp, &line)) {
-          const char* fn = strrchr(line.FileName, '\\'); fn = fn ? fn + 1 : line.FileName;
-          char tmp[256]; snprintf(tmp, sizeof(tmp), " [%s:%lu]", fn, line.LineNumber); r += tmp;
-        }
-        return " " + r;
-      }
-      sym->Release();
     }
   }
 
@@ -138,8 +146,7 @@ std::string Sym::resolve(uint64_t addr) {
   alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
   SYMBOL_INFO* si = (SYMBOL_INFO*)buf;
   si->SizeOfStruct = sizeof(SYMBOL_INFO); si->MaxNameLen = 255;
-  DWORD64 disp = 0;
-  std::string r;
+  DWORD64 disp = 0; std::string r;
   if (SymFromAddr(proc, addr, &disp, si)) {
     r += si->Name;
     if (disp) { char tmp[64]; snprintf(tmp, sizeof(tmp), "+0x%llx", (unsigned long long)disp); r += tmp; }

@@ -7,3 +7,4 @@ testing/
 third_party/
 tools/
 v8/
+.vscode
