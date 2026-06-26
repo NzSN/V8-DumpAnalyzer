@@ -16,7 +16,7 @@ BOOL CALLBACK read_mem(HANDLE, DWORD64 addr, PVOID buf, DWORD sz, LPDWORD read) 
 bool Sym::init(const char* path, const MD& m) {
   proc = GetCurrentProcess();
   CoInitialize(NULL);
-  SymSetOptions(SYMOPT_UNDNAME | SYMOPT_LOAD_LINES | SYMOPT_LOAD_ANYTHING);
+  SymSetOptions(SYMOPT_UNDNAME | SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_ANYTHING);
   if (!SymInitialize(proc, NULL, FALSE)) return false;
   if (path) SymSetSearchPath(proc, path);
 
@@ -48,53 +48,60 @@ bool Sym::init(const char* path, const MD& m) {
     SymLoadModuleEx(proc, NULL, found.c_str(), NULL, mod.base, mod.sz, NULL, 0);
   }
 
-  // Open DIA sessions via DllGetClassObject (msdia140.dll may not be COM-registered)
-  for (auto& mod : m.mods) {
-    IMAGEHLP_MODULE64 mi = { sizeof(IMAGEHLP_MODULE64) };
-    if (!SymGetModuleInfo64(proc, mod.base, &mi) || !mi.LoadedPdbName[0])
-      continue;
-    wchar_t wpdb[MAX_PATH] = {};
-    mbstowcs(wpdb, mi.LoadedPdbName, MAX_PATH);
-    IDiaDataSource* src = NULL;
-    HMODULE hDia = LoadLibraryW(L"msdia140.dll");
-    if (hDia) {
-      auto DllGC = (decltype(&DllGetClassObject))GetProcAddress(hDia, "DllGetClassObject");
-      if (DllGC) {
-        IClassFactory* cf = NULL;
-        if (SUCCEEDED(DllGC(CLSID_DiaSource, IID_IClassFactory, (void**)&cf))) {
-          if (SUCCEEDED(cf->CreateInstance(NULL, IID_IDiaDataSource, (void**)&src))) {
-            if (SUCCEEDED(src->loadDataFromPdb(wpdb))) {
-              IDiaSession* sess = NULL;
-              if (SUCCEEDED(src->openSession(&sess))) {
-                dia_sessions[mod.base] = sess;
-                dia_sources[mod.base] = src;
-                cf->Release();
-                continue;
-              }
-            }
-          }
-          cf->Release();
-        }
-      }
-    }
-    if (src) src->Release();
-  }
-
+  // Remove eager DIA loading — load on demand in resolve()
   ok = true;
   return true;
+}
+
+// Lazy-load DIA session for a module
+IDiaSession* Sym::get_dia(uint64_t mod_base) {
+  if (!ok) return NULL;
+  auto it = dia_sessions.find(mod_base);
+  if (it != dia_sessions.end()) return it->second;
+  // Load on demand
+  IMAGEHLP_MODULE64 mi = { sizeof(IMAGEHLP_MODULE64) };
+  if (!SymGetModuleInfo64(proc, mod_base, &mi) || !mi.LoadedPdbName[0])
+    return NULL;
+  // Load PDB path is known from CV record even with deferred loads
+  wchar_t wpdb[MAX_PATH] = {};
+  mbstowcs(wpdb, mi.LoadedPdbName, MAX_PATH);
+  IDiaDataSource* src = NULL;
+  HMODULE hDia = LoadLibraryW(L"msdia140.dll");
+  if (hDia) {
+    auto DllGC = (decltype(&DllGetClassObject))GetProcAddress(hDia, "DllGetClassObject");
+    if (DllGC) {
+      IClassFactory* cf = NULL;
+      if (SUCCEEDED(DllGC(CLSID_DiaSource, IID_IClassFactory, (void**)&cf))) {
+        if (SUCCEEDED(cf->CreateInstance(NULL, IID_IDiaDataSource, (void**)&src))) {
+          if (SUCCEEDED(src->loadDataFromPdb(wpdb))) {
+            IDiaSession* sess = NULL;
+            if (SUCCEEDED(src->openSession(&sess))) {
+              dia_sessions[mod_base] = sess;
+              dia_sources[mod_base] = src;
+              cf->Release();
+              return sess;
+            }
+          }
+        }
+        cf->Release();
+      }
+    }
+  }
+  if (src) src->Release();
+  return NULL;
 }
 
 std::string Sym::resolve(uint64_t addr) {
   if (!ok) return {};
   uint64_t mod_base = SymGetModuleBase64(proc, addr);
-  auto it = dia_sessions.find(mod_base);
 
-  // DIA scope-level resolution (finds public+private symbols like CDB)
-  if (it != dia_sessions.end()) {
+  // DIA scope-level resolution
+  IDiaSession* session = get_dia(mod_base);
+  if (session) {
     IDiaSymbol* sym = NULL;
     LONG disp = 0;
     ULONGLONG rva = addr - mod_base;
-    if (SUCCEEDED(it->second->findSymbolByRVAEx((DWORD)rva, SymTagNull, &sym, &disp)) && sym) {
+    if (SUCCEEDED(session->findSymbolByRVAEx((DWORD)rva, SymTagNull, &sym, &disp)) && sym) {
       // Walk lexical parent chain if innermost symbol has no name
       IDiaSymbol* named = sym; sym = NULL;
       while (named) {
@@ -110,7 +117,7 @@ std::string Sym::resolve(uint64_t addr) {
       // Also try findSymbolByRVAEx with SymTagFunction for function name
       if (!named) {
         IDiaSymbol* fnsym = NULL; LONG fnd = 0;
-        if (SUCCEEDED(it->second->findSymbolByRVAEx((DWORD)rva, SymTagFunction, &fnsym, &fnd)) && fnsym) {
+        if (SUCCEEDED(session->findSymbolByRVAEx((DWORD)rva, SymTagFunction, &fnsym, &fnd)) && fnsym) {
           named = fnsym;
           disp = fnd;
         }
@@ -153,6 +160,8 @@ std::string Sym::resolve(uint64_t addr) {
 
 void Sym::walk(const MD& m) {
   if (!ok || !m.hc) return;
+
+  // Step 1: walk stack to collect addresses
   CONTEXT ctx = {};
   memcpy(&ctx, &m.cx, sizeof(m.cx));
   ctx.ContextFlags = CONTEXT_FULL;
@@ -163,21 +172,136 @@ void Sym::walk(const MD& m) {
   sf.AddrStack.Mode = AddrModeFlat;
   sf.AddrFrame.Offset = ctx.Rbp;
   sf.AddrFrame.Mode = AddrModeFlat;
-  printf("=== Native Stack ===\n");
   extern void set_g_md(const MD*);
   set_g_md(&m);
+  std::vector<uint64_t> addrs;
   for (int d = 0; d < 256; d++) {
     if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, NULL, &sf, &ctx,
                      read_mem, SymFunctionTableAccess64, SymGetModuleBase64, NULL))
       break;
-    std::string s = resolve(sf.AddrPC.Offset);
+    addrs.push_back(sf.AddrPC.Offset);
+  }
+  set_g_md(nullptr);
+
+  // Step 2: locate electron.exe image path
+  std::string exe_path;
+  for (auto& mod : m.mods) {
+    wchar_t wname[MAX_PATH] = {};
+    m.rd(mod.namerva + 4, sizeof(wname) - 2, wname);
+    char aname[MAX_PATH] = {};
+    wcstombs(aname, wname, sizeof(aname));
+    if (!strstr(aname, "electron.exe")) continue;
+    IMAGEHLP_MODULE64 mi = { sizeof(IMAGEHLP_MODULE64) };
+    if (SymGetModuleInfo64(proc, mod.base, &mi)) exe_path = mi.LoadedImageName;
+    break;
+  }
+
+  std::map<uint64_t, std::string> sym_map, src_map;
+  if (!exe_path.empty()) {
+    // Copy PDB alongside EXE (required by llvm-symbolizer)
+    char pdb_dst[MAX_PATH];
+    snprintf(pdb_dst, sizeof(pdb_dst), "%s.pdb", exe_path.c_str());
+    for (auto& mod : m.mods) {
+      wchar_t wname[MAX_PATH] = {};
+      m.rd(mod.namerva + 4, sizeof(wname) - 2, wname);
+      char aname[MAX_PATH] = {}; wcstombs(aname, wname, sizeof(aname));
+      if (!strstr(aname, "electron.exe")) continue;
+      IMAGEHLP_MODULE64 mi = { sizeof(IMAGEHLP_MODULE64) };
+      if (SymGetModuleInfo64(proc, mod.base, &mi) && mi.LoadedPdbName[0]) {
+        CopyFileA(mi.LoadedPdbName, pdb_dst, FALSE);
+        break;
+      }
+    }
+    // Use llvm-symbolizer from Electron's toolchain
+    // Build address input: PE preferred base (0x140000000) + RVA
+    std::string addr_str;
+    std::vector<uint64_t> dedup;
+    for (auto addr : addrs) {
+      uint64_t mbase = SymGetModuleBase64(proc, addr);
+      if (!mbase) continue;
+      bool dup = false;
+      for (auto d : dedup) if (d == addr) { dup = true; break; }
+      if (dup) continue;
+      dedup.push_back(addr);
+      uint64_t pva = 0x140000000ULL + (addr - mbase);
+      char tmp[32]; snprintf(tmp, sizeof(tmp), "0x%llX\n", (unsigned long long)pva);
+      addr_str += tmp;
+    }
+    if (!addr_str.empty()) {
+      HANDLE hInR, hInW, hOutR, hOutW;
+      SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+      CreatePipe(&hInR, &hInW, &sa, 0);
+      CreatePipe(&hOutR, &hOutW, &sa, 0);
+      SetHandleInformation(hOutR, HANDLE_FLAG_INHERIT, 0);
+      STARTUPINFOA si = { sizeof(si) };
+      si.dwFlags = STARTF_USESTDHANDLES;
+      si.hStdInput  = hInR;
+      si.hStdOutput = hOutW;
+      si.hStdError  = hOutW;
+      PROCESS_INFORMATION pi = {};
+      char cmd[1024];
+      const char* llvm_sym = "llvm-symbolizer";
+      // Prefer Electron's LLVM toolchain (same as build.bat uses for clang-cl)
+      if (GetFileAttributesA("D:\\Codebase\\electron\\src\\third_party\\llvm-build\\Release+Asserts\\bin\\llvm-symbolizer.exe") != INVALID_FILE_ATTRIBUTES)
+        llvm_sym = "\"D:\\Codebase\\electron\\src\\third_party\\llvm-build\\Release+Asserts\\bin\\llvm-symbolizer.exe\"";
+      snprintf(cmd, sizeof(cmd),
+        "%s --obj=\"%s\" --output-style=LLVM --functions=linkage",
+        llvm_sym, exe_path.c_str());
+      if (CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(hOutW); CloseHandle(hInR);
+        DWORD wx; WriteFile(hInW, addr_str.c_str(), (DWORD)addr_str.size(), &wx, NULL);
+        CloseHandle(hInW);
+        WaitForSingleObject(pi.hProcess, 30000);
+        // Read output after process exits
+        char obuf[65536] = {}; DWORD orx = 0;
+        ReadFile(hOutR, obuf, sizeof(obuf) - 1, &orx, NULL);
+        CloseHandle(hOutR);
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+        printf("  [llvm] output (%u bytes): %.200s\n", orx, obuf);
+        // Parse: function\nsource\nblank...
+        std::string out(obuf, orx);
+        size_t pos = 0, ai = 0;
+        while (pos < out.size() && ai < dedup.size()) {
+          size_t nl1 = out.find('\n', pos);
+          size_t nl2 = nl1 != std::string::npos ? out.find('\n', nl1 + 1) : std::string::npos;
+          if (nl1 == std::string::npos) break;
+          std::string func = out.substr(pos, nl1 - pos);
+          std::string src;
+          if (nl2 != std::string::npos) src = out.substr(nl1 + 1, nl2 - nl1 - 1);
+          if (!func.empty() && func != "??") {
+            sym_map[dedup[ai]] = func;
+            if (!src.empty() && src != "??:0" && src != "??:0:0") src_map[dedup[ai]] = src;
+          }
+          pos = nl2 != std::string::npos ? nl2 + 1 : nl1 + 1;
+          ai++;
+        }
+      } else {
+        printf("  [llvm] CreateProcess FAILED cmd=%s\n", cmd);
+        CloseHandle(hOutW); CloseHandle(hOutR); CloseHandle(hInW); CloseHandle(hInR);
+      }
+    }
+  }
+
+  // Step 3: display
+  printf("=== Native Stack ===\n");
+  for (size_t d = 0; d < addrs.size(); d++) {
+    uint64_t addr = addrs[d];
+    std::string r;
+    auto sit = sym_map.find(addr);
+    if (sit != sym_map.end()) {
+      r = sit->second;
+      auto src = src_map.find(addr);
+      if (src != src_map.end()) r += " [" + src->second + "]";
+    } else {
+      r = resolve(addr);
+      if (!r.empty() && r[0] == ' ') r = r.substr(1);
+    }
     if (d == 0)
-      printf("  #cr  | 0x%013llx | <crash>%s\n", (unsigned long long)sf.AddrPC.Offset, s.c_str());
+      printf("  #cr  | 0x%013llx | <crash> %s\n", (unsigned long long)addr, r.c_str());
     else
-      printf("  #%02d  | 0x%013llx |%s\n", d, (unsigned long long)sf.AddrPC.Offset, s.c_str());
+      printf("  #%02llu  | 0x%013llx | %s\n", (unsigned long long)d, (unsigned long long)addr, r.c_str());
   }
   printf("\n");
-  set_g_md(nullptr);
 }
 
 Sym::~Sym() {

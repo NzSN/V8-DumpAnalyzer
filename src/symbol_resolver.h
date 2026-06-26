@@ -19,6 +19,7 @@ struct Sym {
   ~Sym();
 
 private:
+  IDiaSession* get_dia(uint64_t mod_base);
   std::map<uint64_t, IDiaSession*> dia_sessions;
   std::map<uint64_t, IDiaDataSource*> dia_sources;
 };
